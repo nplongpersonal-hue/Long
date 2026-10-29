@@ -12,6 +12,25 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Plus+Jakarta+Sans:wght@500;600;700&family=Public+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
+    <script>
+      // Tự động nạp bản build sẵn trong ./docs/ nếu GitHub Pages đang cấu hình trỏ trực tiếp vào nhánh main / (root)
+      if (window.location.hostname.endsWith('github.io')) {
+        window.addEventListener('DOMContentLoaded', function () {
+          var rawEntry = document.querySelector('script[src*="/src/main.tsx"]');
+          if (rawEntry) {
+            var css = document.createElement('link');
+            css.rel = 'stylesheet';
+            css.href = './docs/assets/index.css';
+            document.head.appendChild(css);
+
+            var js = document.createElement('script');
+            js.type = 'module';
+            js.src = './docs/assets/app.js';
+            document.body.appendChild(js);
+          }
+        });
+      }
+    </script>
   </head>
   <body>
     <div id="root"></div>
