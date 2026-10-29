@@ -1,4 +1,5 @@
 import { generateSampleDocxBase64, SampleParagraphSpec } from './docxEngine';
+import firebaseConfig from '../../firebase-applet-config.json';
 
 export type MailingsFieldCategory =
   | 'Cá nhân & Nhân sự'
@@ -639,56 +640,102 @@ export function saveTemplatesConfig(config: TemplatesConfigMap): void {
 }
 
 /**
- * Fetches shared templates from the server (`/api/templates`) and merges with local templates.
+ * Loads the pre-bundled static `templates_store_backup.json` shipped in the app root (`public/` & `docs/`).
+ * Works 100% offline/serverless on GitHub Pages without CORS or authentication.
+ */
+export async function fetchStaticBundledBackup(): Promise<TemplatesConfigMap> {
+  const candidatePaths = ['./templates_store_backup.json', '/templates_store_backup.json'];
+  for (const path of candidatePaths) {
+    try {
+      const res = await fetch(path, { cache: 'no-store' });
+      if (!res.ok) continue;
+      const text = await res.text();
+      if (!text || text.trim().startsWith('<')) continue;
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as TemplatesConfigMap;
+      }
+    } catch {
+      // Ignore and try next path
+    }
+  }
+  return {};
+}
+
+/**
+ * Fetches shared templates from the server (`/api/templates`) or static `./templates_store_backup.json` (on GitHub Pages)
+ * and merges with local templates.
  */
 export async function syncTemplatesWithServer(): Promise<TemplatesConfigMap> {
   const localConfig = loadTemplatesConfig();
+  const staticBackup = await fetchStaticBundledBackup();
+
+  let serverConfig: TemplatesConfigMap = {};
+  let serverAvailable = false;
+
   try {
     const res = await fetch('/api/templates');
-    if (res.ok) {
+    const contentType = res.headers.get('content-type') || '';
+    if (res.ok && contentType.includes('application/json')) {
       const data = await res.json();
-      const serverConfig = (data?.templates || {}) as TemplatesConfigMap;
-      const serverKeys = Object.keys(serverConfig);
-      const localKeys = Object.keys(localConfig);
-
-      if (serverKeys.length > 0 || localKeys.length > 0) {
-        // Merge so templates created locally or on server are both preserved
-        const merged: TemplatesConfigMap = { ...localConfig, ...serverConfig };
-        // If local had newer updates or extra templates not on server yet, push merged back to server
-        let needsPush = false;
-        for (const k of localKeys) {
-          if (!serverConfig[k]) {
-            merged[k] = localConfig[k];
-            needsPush = true;
-          } else if (
-            (localConfig[k].updated_at || '') > (serverConfig[k].updated_at || '')
-          ) {
-            merged[k] = localConfig[k];
-            needsPush = true;
-          }
-        }
-
-        try {
-          localStorage.setItem(STORAGE_KEY_CONFIG, JSON.stringify(merged, null, 2));
-        } catch {
-          // Ignore
-        }
-
-        if (needsPush) {
-          await fetch('/api/templates', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ templates: merged, mode: 'merge' }),
-          });
-        }
-
-        return merged;
-      }
+      serverConfig = (data?.templates || {}) as TemplatesConfigMap;
+      serverAvailable = true;
     }
   } catch (err) {
     console.warn('Failed to fetch shared templates from server:', err);
   }
-  return localConfig;
+
+  // Merge static bundled templates, server templates, and local templates
+  const merged: TemplatesConfigMap = {
+    ...staticBackup,
+    ...serverConfig,
+    ...localConfig,
+  };
+
+  // Ensure newer timestamps win between staticBackup, serverConfig, and localConfig
+  const allSources = [staticBackup, serverConfig, localConfig];
+  for (const source of allSources) {
+    for (const [k, entry] of Object.entries(source)) {
+      if (!entry || !entry.base64_docx) continue;
+      const existing = merged[k];
+      if (!existing || (entry.updated_at || '') >= (existing.updated_at || '')) {
+        merged[k] = entry;
+      }
+    }
+  }
+
+  // If we have the 6 real administrative templates from staticBackup, remove the 3 demo starter templates
+  // if they were only auto-seeded earlier
+  if (Object.keys(staticBackup).length > 0) {
+    const demoNames = [
+      'Giấy đề nghị thanh toán',
+      'Đơn xin nghỉ phép năm',
+      'Biên bản bàn giao thiết bị',
+    ];
+    for (const demoName of demoNames) {
+      if (!staticBackup[demoName] && merged[demoName]?.updated_at?.startsWith('2026-10-23T06:0')) {
+        delete merged[demoName];
+      }
+    }
+  }
+
+  if (Object.keys(merged).length > 0) {
+    try {
+      localStorage.setItem(STORAGE_KEY_CONFIG, JSON.stringify(merged, null, 2));
+    } catch {
+      // Ignore storage quota errors
+    }
+
+    if (serverAvailable && Object.keys(merged).length > Object.keys(serverConfig).length) {
+      fetch('/api/templates', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ templates: merged, mode: 'merge' }),
+      }).catch(() => {});
+    }
+  }
+
+  return merged;
 }
 
 /**
@@ -750,19 +797,109 @@ export function extractDriveIdFromUrlQuery(): string | null {
   return null;
 }
 
+function tryParseTemplatesJson(rawText: string): TemplatesConfigMap | null {
+  if (!rawText) return null;
+  let text = rawText.trim();
+
+  // Handle allorigins /get wrapper: { "contents": "..." }
+  if (text.startsWith('{') && text.includes('"contents"')) {
+    try {
+      const wrapper = JSON.parse(text);
+      if (typeof wrapper?.contents === 'string') {
+        text = wrapper.contents.trim();
+      }
+    } catch {
+      // Not an allorigins wrapper
+    }
+  }
+
+  // Handle base64 data URI returned by allorigins when Content-Disposition is attachment
+  if (text.startsWith('data:')) {
+    const commaIdx = text.indexOf(',');
+    if (commaIdx !== -1) {
+      try {
+        const base64Part = text.slice(commaIdx + 1).trim();
+        text = decodeURIComponent(escape(window.atob(base64Part))).trim();
+      } catch {
+        return null;
+      }
+    }
+  }
+
+  if (!text || text.startsWith('<')) return null;
+
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      // Verify it looks like a TemplatesConfigMap (values have base64_docx or selected_indices)
+      const values = Object.values(parsed) as any[];
+      if (
+        values.length > 0 &&
+        values.some((v) => v && typeof v === 'object' && ('base64_docx' in v || 'selected_indices' in v))
+      ) {
+        return parsed as TemplatesConfigMap;
+      }
+    }
+  } catch {
+    // Not valid JSON
+  }
+  return null;
+}
+
 /**
  * Client-side fallback to download a publicly shared Google Drive JSON file when hosted on static GitHub Pages.
  */
 async function fetchPublicDriveJsonClientFallback(
-  fileId: string
+  fileId: string,
+  accessToken?: string | null
 ): Promise<TemplatesConfigMap | null> {
+  // 1. Try Google Drive API v3 with OAuth Access Token if user is signed in
+  if (accessToken) {
+    try {
+      const res = await fetch(
+        `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`,
+        {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        }
+      );
+      if (res.ok) {
+        const text = await res.text();
+        const parsed = tryParseTemplatesJson(text);
+        if (parsed) return parsed;
+      }
+    } catch {
+      // Fall through
+    }
+  }
+
+  // 2. Try Google Drive API v3 with public API key (supports CORS natively for publicly shared Drive files)
+  if (firebaseConfig?.apiKey) {
+    try {
+      const res = await fetch(
+        `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(
+          fileId
+        )}?alt=media&key=${encodeURIComponent(firebaseConfig.apiKey)}`
+      );
+      if (res.ok) {
+        const text = await res.text();
+        const parsed = tryParseTemplatesJson(text);
+        if (parsed) return parsed;
+      }
+    } catch {
+      // Fall through
+    }
+  }
+
+  // 3. Try multiple CORS-friendly endpoints (including allorigins /get which wraps binary/attachment responses in JSON)
+  const driveUcUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
+  const driveUserContentUrl = `https://drive.usercontent.google.com/download?id=${fileId}&export=download&confirm=t`;
+
   const candidateUrls = [
-    `https://api.allorigins.win/raw?url=${encodeURIComponent(
-      `https://drive.google.com/uc?export=download&id=${fileId}`
-    )}`,
-    `https://corsproxy.io/?${encodeURIComponent(
-      `https://drive.google.com/uc?export=download&id=${fileId}`
-    )}`,
+    `https://api.allorigins.win/get?url=${encodeURIComponent(driveUcUrl)}`,
+    `https://api.allorigins.win/get?url=${encodeURIComponent(driveUserContentUrl)}`,
+    `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(driveUcUrl)}`,
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(driveUserContentUrl)}`,
+    `https://corsproxy.io/?${encodeURIComponent(driveUcUrl)}`,
   ];
 
   for (const url of candidateUrls) {
@@ -770,15 +907,19 @@ async function fetchPublicDriveJsonClientFallback(
       const res = await fetch(url);
       if (!res.ok) continue;
       const text = await res.text();
-      if (!text || text.trim().startsWith('<')) continue;
-      const parsed = JSON.parse(text);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        return parsed as TemplatesConfigMap;
-      }
+      const parsed = tryParseTemplatesJson(text);
+      if (parsed) return parsed;
     } catch {
       // Try next proxy
     }
   }
+
+  // 4. Fallback to bundled static `./templates_store_backup.json` on GitHub Pages
+  const staticBackup = await fetchStaticBundledBackup();
+  if (Object.keys(staticBackup).length > 0) {
+    return staticBackup;
+  }
+
   return null;
 }
 
@@ -850,10 +991,26 @@ export async function fetchSharedDriveConfig(
     }
   }
 
+  const syncedTemplates = await syncTemplatesWithServer();
+
+  if (!cachedDriveConfig && Object.keys(syncedTemplates).length > 0) {
+    const firstWithDrive = Object.values(syncedTemplates).find((t) => t.drive_file_id);
+    if (firstWithDrive?.drive_file_id) {
+      cachedDriveConfig = {
+        backupFileId: firstWithDrive.drive_file_id,
+        backupFileName: 'templates_store_backup.json',
+        backupWebViewLink: firstWithDrive.drive_web_view_link,
+        folderName: 'Thư Viện Biểu Mẫu Word (Dùng Chung App)',
+        updatedAt: firstWithDrive.updated_at || new Date().toISOString(),
+        templateCount: Object.keys(syncedTemplates).length,
+      };
+    }
+  }
+
   return {
     driveConfig: cachedDriveConfig,
-    templates: loadTemplatesConfig(),
-    syncedFromDrive: false,
+    templates: syncedTemplates,
+    syncedFromDrive: Boolean(cachedDriveConfig),
   };
 }
 
@@ -861,7 +1018,10 @@ export async function fetchSharedDriveConfig(
  * Links any publicly shared Google Drive file ID (`templates_store_backup.json`) so all app visitors
  * load templates directly from that Google Drive file (supports both backend and static GitHub Pages).
  */
-export async function loadPublicDriveLibraryByFileId(fileId: string): Promise<{
+export async function loadPublicDriveLibraryByFileId(
+  fileId: string,
+  accessToken?: string | null
+): Promise<{
   driveConfig: SharedDrivePublicationInfo;
   templates: TemplatesConfigMap;
 }> {
@@ -871,24 +1031,26 @@ export async function loadPublicDriveLibraryByFileId(fileId: string): Promise<{
     if (res.ok && contentType.includes('application/json')) {
       const data = await res.json();
       const templates = (data.templates || {}) as TemplatesConfigMap;
-      try {
-        localStorage.setItem(STORAGE_KEY_CONFIG, JSON.stringify(templates, null, 2));
-        if (data.driveConfig) {
-          localStorage.setItem('smart_word_drive_config_v1', JSON.stringify(data.driveConfig));
+      if (Object.keys(templates).length > 0) {
+        try {
+          localStorage.setItem(STORAGE_KEY_CONFIG, JSON.stringify(templates, null, 2));
+          if (data.driveConfig) {
+            localStorage.setItem('smart_word_drive_config_v1', JSON.stringify(data.driveConfig));
+          }
+        } catch {
+          // Ignore
         }
-      } catch {
-        // Ignore
+        return {
+          driveConfig: data.driveConfig as SharedDrivePublicationInfo,
+          templates,
+        };
       }
-      return {
-        driveConfig: data.driveConfig as SharedDrivePublicationInfo,
-        templates,
-      };
     }
   } catch {
     // Fallback to client-side public Drive fetch for static GitHub Pages
   }
 
-  const clientTemplates = await fetchPublicDriveJsonClientFallback(fileId);
+  const clientTemplates = await fetchPublicDriveJsonClientFallback(fileId, accessToken);
   if (clientTemplates && Object.keys(clientTemplates).length > 0) {
     const fallbackDriveConfig: SharedDrivePublicationInfo = {
       backupFileId: fileId,
@@ -910,7 +1072,7 @@ export async function loadPublicDriveLibraryByFileId(fileId: string): Promise<{
   }
 
   throw new Error(
-    'Không thể tải dữ liệu từ Google Drive. Hãy kiểm tra quyền chia sẻ công khai ("Bất kỳ ai có đường liên kết") của tệp trên Google Drive.'
+    'Không thể tải dữ liệu từ Google Drive. Hãy kiểm tra quyền chia sẻ công khai ("Bất kỳ ai có đường liên kết") hoặc dùng nút "Chọn tệp .json từ máy" bên dưới.'
   );
 }
 
@@ -1028,17 +1190,10 @@ const SAMPLE_HANDOVER_SPEC: SampleParagraphSpec[] = [
 ];
 
 export async function ensureStarterTemplatesSeeded(): Promise<TemplatesConfigMap> {
-  // First check shared server templates + local templates
+  // First check shared server templates + static bundled templates_store_backup.json + local templates
   const synced = await syncTemplatesWithServer();
-  const hasV3Seeded = localStorage.getItem(STORAGE_KEY_SEEDED) === 'true';
-
-  // Check if default starter templates still have old format without Header (Headnote) & Footnote
-  const needsStarterUpgrade =
-    !hasV3Seeded ||
-    (synced['Giấy đề nghị thanh toán'] &&
-      synced['Giấy đề nghị thanh toán'].total_paragraphs <= 14);
-
-  if (Object.keys(synced).length > 0 && !needsStarterUpgrade) {
+  if (Object.keys(synced).length > 0) {
+    localStorage.setItem(STORAGE_KEY_SEEDED, 'true');
     return synced;
   }
 

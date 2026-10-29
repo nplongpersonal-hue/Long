@@ -26,12 +26,14 @@ import {
   downloadDriveJsonFile,
   DriveFileItem,
   extractDriveFileIdFromInput,
+  getAccessToken,
   listDriveWordAndBackupFiles,
   publishLibraryToSharedGoogleDrive,
   SHARED_BACKUP_FILE_NAME,
   SHARED_DRIVE_FOLDER_NAME,
 } from '../utils/googleDriveService';
 import {
+  fetchStaticBundledBackup,
   loadPublicDriveLibraryByFileId,
   SharedDrivePublicationInfo,
   TemplatesConfigMap,
@@ -293,7 +295,11 @@ export const GoogleDriveModal: React.FC<GoogleDriveModalProps> = ({
     setIsLinkingPublicDrive(true);
     setStatusMessage(null);
     try {
-      const { driveConfig, templates } = await loadPublicDriveLibraryByFileId(fileId);
+      const token = await getAccessToken();
+      const { driveConfig, templates } = await loadPublicDriveLibraryByFileId(
+        fileId,
+        token
+      );
       onUpdateSharedDriveInfo(driveConfig, templates);
       setPublicDriveLinkInput('');
       setStatusMessage({
@@ -307,6 +313,88 @@ export const GoogleDriveModal: React.FC<GoogleDriveModalProps> = ({
           err instanceof Error
             ? err.message
             : 'Không thể đọc tệp từ đường link Google Drive này.',
+      });
+    } finally {
+      setIsLinkingPublicDrive(false);
+    }
+  };
+
+  // Import templates_store_backup.json directly from computer (works 100% offline/static on GitHub Pages)
+  const handleLocalBackupJsonUpload = async (
+    e: React.ChangeEvent<HTMLInputElement>
+  ) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+
+    setStatusMessage(null);
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('Tệp JSON không đúng định dạng kho biểu mẫu.');
+      }
+      const templates = parsed as TemplatesConfigMap;
+      const count = Object.keys(templates).length;
+      if (count === 0) {
+        throw new Error('Tệp JSON không chứa biểu mẫu nào.');
+      }
+      const firstWithDrive = Object.values(templates).find((t) => t.drive_file_id);
+      const info: SharedDrivePublicationInfo = {
+        backupFileId: firstWithDrive?.drive_file_id || 'local_backup_json',
+        backupFileName: file.name,
+        backupWebViewLink: firstWithDrive?.drive_web_view_link,
+        folderName: SHARED_DRIVE_FOLDER_NAME,
+        updatedAt: new Date().toISOString(),
+        templateCount: count,
+      };
+      onUpdateSharedDriveInfo(info, templates);
+      setStatusMessage({
+        type: 'success',
+        text: `Đã nạp thành công ${count} biểu mẫu từ tệp "${file.name}"!`,
+      });
+    } catch (err) {
+      setStatusMessage({
+        type: 'error',
+        text:
+          err instanceof Error
+            ? err.message
+            : 'Không thể đọc tệp JSON sao lưu.',
+      });
+    }
+  };
+
+  // Load the pre-bundled static templates_store_backup.json from GitHub Pages / public folder
+  const handleLoadStaticBundledLibrary = async () => {
+    setIsLinkingPublicDrive(true);
+    setStatusMessage(null);
+    try {
+      const bundled = await fetchStaticBundledBackup();
+      const count = Object.keys(bundled).length;
+      if (count === 0) {
+        throw new Error('Không tìm thấy tệp kho mẫu tích hợp sẵn.');
+      }
+      const firstWithDrive = Object.values(bundled).find((t) => t.drive_file_id);
+      const info: SharedDrivePublicationInfo = {
+        backupFileId: firstWithDrive?.drive_file_id || 'github_pages_bundled',
+        backupFileName: SHARED_BACKUP_FILE_NAME,
+        backupWebViewLink: firstWithDrive?.drive_web_view_link,
+        folderName: SHARED_DRIVE_FOLDER_NAME,
+        updatedAt: new Date().toISOString(),
+        templateCount: count,
+      };
+      onUpdateSharedDriveInfo(info, bundled);
+      setStatusMessage({
+        type: 'success',
+        text: `Đã đồng bộ thành công ${count} biểu mẫu từ Kho Mẫu Tích Hợp Sẵn!`,
+      });
+    } catch (err) {
+      setStatusMessage({
+        type: 'error',
+        text:
+          err instanceof Error
+            ? err.message
+            : 'Không thể nạp kho mẫu tích hợp sẵn.',
       });
     } finally {
       setIsLinkingPublicDrive(false);
@@ -791,6 +879,33 @@ export const GoogleDriveModal: React.FC<GoogleDriveModalProps> = ({
                     : 'Kết nối tệp Drive này'}
                 </span>
               </button>
+            </div>
+
+            <div className="pt-2 border-t border-slate-200 flex flex-wrap items-center justify-between gap-2">
+              <span className="text-[11px] text-slate-500">
+                Chạy trên GitHub Pages hoặc không qua proxy? Bạn có thể nạp trực tiếp từ tệp JSON:
+              </span>
+              <div className="flex flex-wrap items-center gap-2">
+                <label className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-blue-700 bg-blue-50 border border-blue-200 hover:bg-blue-100 rounded-md cursor-pointer">
+                  <CloudUpload className="w-3.5 h-3.5" />
+                  <span>Chọn tệp .json từ máy</span>
+                  <input
+                    type="file"
+                    accept=".json,application/json"
+                    onChange={handleLocalBackupJsonUpload}
+                    className="hidden"
+                  />
+                </label>
+                <button
+                  type="button"
+                  disabled={isLinkingPublicDrive}
+                  onClick={handleLoadStaticBundledLibrary}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-emerald-800 bg-emerald-50 border border-emerald-200 hover:bg-emerald-100 rounded-md cursor-pointer"
+                >
+                  <CloudDownload className="w-3.5 h-3.5" />
+                  <span>Nạp Kho Mẫu Mặc Định (6 mẫu)</span>
+                </button>
+              </div>
             </div>
           </div>
         </div>
