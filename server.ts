@@ -339,11 +339,9 @@ async function startServer() {
 
   const distPath = path.join(__dirname, 'dist');
   const distIndexHtml = path.join(distPath, 'index.html');
-  const isProduction =
-    (process.env.NODE_ENV === 'production' || process.env.npm_lifecycle_event === 'start') &&
-    fs.existsSync(distIndexHtml);
+  const hasBuiltDist = fs.existsSync(distIndexHtml);
 
-  if (!isProduction) {
+  if (!hasBuiltDist) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true, hmr: false },
