@@ -519,7 +519,13 @@ export async function publishLibraryToSharedGoogleDrive(params: {
     templateCount: Object.keys(updatedTemplatesConfig).length,
   };
 
-  // 6. Register the shared Google Drive file ID and templates with the server so all app visitors load from Drive
+  // 6. Save locally & register with server (if backend exists; on static GitHub Pages this gracefully falls back to localStorage)
+  try {
+    localStorage.setItem('smart_word_drive_config_v1', JSON.stringify(driveInfo));
+  } catch {
+    // Ignore storage error
+  }
+
   await fetch('/api/drive-config', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -527,6 +533,8 @@ export async function publishLibraryToSharedGoogleDrive(params: {
       driveConfig: driveInfo,
       templates: updatedTemplatesConfig,
     }),
+  }).catch(() => {
+    // Static hosting (e.g. GitHub Pages) has no /api/drive-config endpoint
   });
 
   return {

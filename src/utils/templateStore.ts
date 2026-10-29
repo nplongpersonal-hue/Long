@@ -751,8 +751,39 @@ export function extractDriveIdFromUrlQuery(): string | null {
 }
 
 /**
- * Fetches the currently configured shared Google Drive info + templates from the server.
- * When `pullLatestFromDrive = true`, the server directly downloads the latest shared JSON file from Google Drive.
+ * Client-side fallback to download a publicly shared Google Drive JSON file when hosted on static GitHub Pages.
+ */
+async function fetchPublicDriveJsonClientFallback(
+  fileId: string
+): Promise<TemplatesConfigMap | null> {
+  const candidateUrls = [
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(
+      `https://drive.google.com/uc?export=download&id=${fileId}`
+    )}`,
+    `https://corsproxy.io/?${encodeURIComponent(
+      `https://drive.google.com/uc?export=download&id=${fileId}`
+    )}`,
+  ];
+
+  for (const url of candidateUrls) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) continue;
+      const text = await res.text();
+      if (!text || text.trim().startsWith('<')) continue;
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as TemplatesConfigMap;
+      }
+    } catch {
+      // Try next proxy
+    }
+  }
+  return null;
+}
+
+/**
+ * Fetches the currently configured shared Google Drive info + templates from the server (or localStorage/Drive fallback on GitHub Pages).
  */
 export async function fetchSharedDriveConfig(
   pullLatestFromDrive = false
@@ -765,12 +796,20 @@ export async function fetchSharedDriveConfig(
     const res = await fetch(
       `/api/drive-config${pullLatestFromDrive ? '?pull=true' : ''}`
     );
-    if (res.ok) {
+    const contentType = res.headers.get('content-type') || '';
+    if (res.ok && contentType.includes('application/json')) {
       const data = await res.json();
       const templates = (data?.templates || {}) as TemplatesConfigMap;
       if (Object.keys(templates).length > 0) {
         try {
           localStorage.setItem(STORAGE_KEY_CONFIG, JSON.stringify(templates, null, 2));
+        } catch {
+          // Ignore
+        }
+      }
+      if (data?.driveConfig) {
+        try {
+          localStorage.setItem('smart_word_drive_config_v1', JSON.stringify(data.driveConfig));
         } catch {
           // Ignore
         }
@@ -782,10 +821,37 @@ export async function fetchSharedDriveConfig(
       };
     }
   } catch (err) {
-    console.warn('Could not fetch shared Google Drive config:', err);
+    console.warn('Could not fetch shared Google Drive config from backend:', err);
   }
+
+  let cachedDriveConfig: SharedDrivePublicationInfo | null = null;
+  try {
+    const rawDrive = localStorage.getItem('smart_word_drive_config_v1');
+    if (rawDrive) {
+      cachedDriveConfig = JSON.parse(rawDrive) as SharedDrivePublicationInfo;
+    }
+  } catch {
+    // Ignore
+  }
+
+  if (pullLatestFromDrive && cachedDriveConfig?.backupFileId) {
+    const clientPulled = await fetchPublicDriveJsonClientFallback(cachedDriveConfig.backupFileId);
+    if (clientPulled && Object.keys(clientPulled).length > 0) {
+      try {
+        localStorage.setItem(STORAGE_KEY_CONFIG, JSON.stringify(clientPulled, null, 2));
+      } catch {
+        // Ignore
+      }
+      return {
+        driveConfig: cachedDriveConfig,
+        templates: clientPulled,
+        syncedFromDrive: true,
+      };
+    }
+  }
+
   return {
-    driveConfig: null,
+    driveConfig: cachedDriveConfig,
     templates: loadTemplatesConfig(),
     syncedFromDrive: false,
   };
@@ -793,30 +859,59 @@ export async function fetchSharedDriveConfig(
 
 /**
  * Links any publicly shared Google Drive file ID (`templates_store_backup.json`) so all app visitors
- * load templates directly from that Google Drive file.
+ * load templates directly from that Google Drive file (supports both backend and static GitHub Pages).
  */
 export async function loadPublicDriveLibraryByFileId(fileId: string): Promise<{
   driveConfig: SharedDrivePublicationInfo;
   templates: TemplatesConfigMap;
 }> {
-  const res = await fetch(`/api/drive-public/${encodeURIComponent(fileId)}`);
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw new Error(
-      data?.error ||
-        'Không thể tải dữ liệu từ Google Drive. Hãy kiểm tra quyền chia sẻ công khai của tệp trên Google Drive.'
-    );
-  }
-  const templates = (data.templates || {}) as TemplatesConfigMap;
   try {
-    localStorage.setItem(STORAGE_KEY_CONFIG, JSON.stringify(templates, null, 2));
+    const res = await fetch(`/api/drive-public/${encodeURIComponent(fileId)}`);
+    const contentType = res.headers.get('content-type') || '';
+    if (res.ok && contentType.includes('application/json')) {
+      const data = await res.json();
+      const templates = (data.templates || {}) as TemplatesConfigMap;
+      try {
+        localStorage.setItem(STORAGE_KEY_CONFIG, JSON.stringify(templates, null, 2));
+        if (data.driveConfig) {
+          localStorage.setItem('smart_word_drive_config_v1', JSON.stringify(data.driveConfig));
+        }
+      } catch {
+        // Ignore
+      }
+      return {
+        driveConfig: data.driveConfig as SharedDrivePublicationInfo,
+        templates,
+      };
+    }
   } catch {
-    // Ignore
+    // Fallback to client-side public Drive fetch for static GitHub Pages
   }
-  return {
-    driveConfig: data.driveConfig as SharedDrivePublicationInfo,
-    templates,
-  };
+
+  const clientTemplates = await fetchPublicDriveJsonClientFallback(fileId);
+  if (clientTemplates && Object.keys(clientTemplates).length > 0) {
+    const fallbackDriveConfig: SharedDrivePublicationInfo = {
+      backupFileId: fileId,
+      backupFileName: 'templates_store_backup.json',
+      backupWebViewLink: `https://drive.google.com/file/d/${fileId}/view?usp=sharing`,
+      updatedAt: new Date().toISOString(),
+      templateCount: Object.keys(clientTemplates).length,
+    };
+    try {
+      localStorage.setItem(STORAGE_KEY_CONFIG, JSON.stringify(clientTemplates, null, 2));
+      localStorage.setItem('smart_word_drive_config_v1', JSON.stringify(fallbackDriveConfig));
+    } catch {
+      // Ignore
+    }
+    return {
+      driveConfig: fallbackDriveConfig,
+      templates: clientTemplates,
+    };
+  }
+
+  throw new Error(
+    'Không thể tải dữ liệu từ Google Drive. Hãy kiểm tra quyền chia sẻ công khai ("Bất kỳ ai có đường liên kết") của tệp trên Google Drive.'
+  );
 }
 
 export function loadExportHistory(): ExportHistoryRecord[] {
