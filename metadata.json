@@ -1,0 +1,6 @@
+{
+  "name": "Thư Viện Biểu Mẫu Word Thông Minh",
+  "description": "Ứng dụng quản lý, cấu hình dòng văn bản động và điền nhanh biểu mẫu Microsoft Word (.docx) trực tuyến.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
