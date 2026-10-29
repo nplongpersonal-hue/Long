@@ -52,8 +52,19 @@ function readServerTemplates(): Record<string, any> {
     if (fs.existsSync(CONFIG_FILE)) {
       const raw = fs.readFileSync(CONFIG_FILE, 'utf-8');
       const parsed = JSON.parse(raw);
-      memoryTemplatesCache = parsed;
-      return parsed;
+      if (parsed && typeof parsed === 'object' && Object.keys(parsed).length > 0) {
+        memoryTemplatesCache = parsed;
+        return parsed;
+      }
+    }
+    const publicBackup = path.join(__dirname, 'public', 'templates_store_backup.json');
+    if (fs.existsSync(publicBackup)) {
+      const raw = fs.readFileSync(publicBackup, 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && Object.keys(parsed).length > 0) {
+        memoryTemplatesCache = parsed;
+        return parsed;
+      }
     }
   } catch (err) {
     console.error('Error reading templates_store/config.json:', err);
@@ -269,7 +280,15 @@ async function startServer() {
   // GET public Google Drive file by fileId (allows linking any shared Drive file or ?driveId=...)
   app.get('/api/drive-public/:fileId', async (req, res) => {
     const fileId = req.params.fileId;
-    const driveTemplates = await fetchPublicGoogleDriveJson(fileId);
+    let driveTemplates = await fetchPublicGoogleDriveJson(fileId);
+
+    // Fallback to bundled server templates if Google Drive blocks unauthenticated download or link is a folder/docx
+    if (!driveTemplates || Object.keys(driveTemplates).length === 0) {
+      const fallbackTemplates = readServerTemplates();
+      if (fallbackTemplates && Object.keys(fallbackTemplates).length > 0) {
+        driveTemplates = fallbackTemplates;
+      }
+    }
 
     if (!driveTemplates || Object.keys(driveTemplates).length === 0) {
       res.status(404).json({
@@ -285,7 +304,7 @@ async function startServer() {
       backupFileName: existingDriveConfig?.backupFileName || 'templates_store_backup.json',
       backupWebViewLink: `https://drive.google.com/file/d/${fileId}/view?usp=sharing`,
       folderId: existingDriveConfig?.folderId,
-      folderName: existingDriveConfig?.folderName,
+      folderName: existingDriveConfig?.folderName || 'Thư Viện Biểu Mẫu Word (Dùng Chung App)',
       folderWebViewLink: existingDriveConfig?.folderWebViewLink,
       ownerEmail: existingDriveConfig?.ownerEmail,
       updatedAt: new Date().toISOString(),
@@ -349,8 +368,17 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    app.use(express.static(distPath));
+    app.use(
+      express.static(distPath, {
+        etag: false,
+        lastModified: false,
+        setHeaders: (res) => {
+          res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+        },
+      })
+    );
     app.get('*', (_req, res) => {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
       res.sendFile(distIndexHtml);
     });
   }

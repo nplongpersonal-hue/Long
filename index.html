@@ -18,14 +18,15 @@
         window.addEventListener('DOMContentLoaded', function () {
           var rawEntry = document.querySelector('script[src*="/src/main.tsx"]');
           if (rawEntry) {
+            var bust = '?v=' + Date.now();
             var css = document.createElement('link');
             css.rel = 'stylesheet';
-            css.href = './docs/assets/index.css';
+            css.href = './docs/assets/index.css' + bust;
             document.head.appendChild(css);
 
             var js = document.createElement('script');
             js.type = 'module';
-            js.src = './docs/assets/app.js';
+            js.src = './docs/assets/app.js' + bust;
             document.body.appendChild(js);
           }
         });

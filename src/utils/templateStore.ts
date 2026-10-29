@@ -1,5 +1,6 @@
 import { generateSampleDocxBase64, SampleParagraphSpec } from './docxEngine';
 import firebaseConfig from '../../firebase-applet-config.json';
+import bundledTemplatesJson from '../../public/templates_store_backup.json';
 
 export type MailingsFieldCategory =
   | 'Cá nhân & Nhân sự'
@@ -640,11 +641,21 @@ export function saveTemplatesConfig(config: TemplatesConfigMap): void {
 }
 
 /**
- * Loads the pre-bundled static `templates_store_backup.json` shipped in the app root (`public/` & `docs/`).
- * Works 100% offline/serverless on GitHub Pages without CORS or authentication.
+ * Loads the pre-bundled static `templates_store_backup.json` shipped in the app root (`public/` & `docs/`)
+ * and compiled directly into the JS bundle so it works 100% offline/serverless on GitHub Pages.
  */
 export async function fetchStaticBundledBackup(): Promise<TemplatesConfigMap> {
-  const candidatePaths = ['./templates_store_backup.json', '/templates_store_backup.json'];
+  const inMemoryBundled =
+    bundledTemplatesJson && typeof bundledTemplatesJson === 'object'
+      ? (bundledTemplatesJson as unknown as TemplatesConfigMap)
+      : {};
+
+  const candidatePaths = [
+    './templates_store_backup.json',
+    './docs/templates_store_backup.json',
+    './public/templates_store_backup.json',
+    '/templates_store_backup.json',
+  ];
   for (const path of candidatePaths) {
     try {
       const res = await fetch(path, { cache: 'no-store' });
@@ -653,13 +664,16 @@ export async function fetchStaticBundledBackup(): Promise<TemplatesConfigMap> {
       if (!text || text.trim().startsWith('<')) continue;
       const parsed = JSON.parse(text);
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        return parsed as TemplatesConfigMap;
+        return {
+          ...inMemoryBundled,
+          ...(parsed as TemplatesConfigMap),
+        };
       }
     } catch {
       // Ignore and try next path
     }
   }
-  return {};
+  return { ...inMemoryBundled };
 }
 
 /**
@@ -872,18 +886,46 @@ async function fetchPublicDriveJsonClientFallback(
     }
   }
 
-  // 2. Try Google Drive API v3 with public API key (supports CORS natively for publicly shared Drive files)
+  // 2. Try Google Drive API v3 with public API key (supports CORS natively for publicly shared Drive files & folders)
   if (firebaseConfig?.apiKey) {
+    const apiKey = encodeURIComponent(firebaseConfig.apiKey);
     try {
       const res = await fetch(
         `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(
           fileId
-        )}?alt=media&key=${encodeURIComponent(firebaseConfig.apiKey)}`
+        )}?alt=media&key=${apiKey}`
       );
       if (res.ok) {
         const text = await res.text();
         const parsed = tryParseTemplatesJson(text);
         if (parsed) return parsed;
+      } else {
+        // Check if fileId is actually a Google Drive Folder ID containing templates_store_backup.json
+        const listRes = await fetch(
+          `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(
+            `'${fileId}' in parents and trashed = false`
+          )}&fields=files(id,name,mimeType)&key=${apiKey}`
+        );
+        if (listRes.ok) {
+          const listData = await listRes.json();
+          const backupChild = (listData?.files || []).find(
+            (f: any) =>
+              f.name === 'templates_store_backup.json' ||
+              f.name?.endsWith('.json')
+          );
+          if (backupChild?.id) {
+            const childRes = await fetch(
+              `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(
+                backupChild.id
+              )}?alt=media&key=${apiKey}`
+            );
+            if (childRes.ok) {
+              const childText = await childRes.text();
+              const parsedChild = tryParseTemplatesJson(childText);
+              if (parsedChild) return parsedChild;
+            }
+          }
+        }
       }
     } catch {
       // Fall through
