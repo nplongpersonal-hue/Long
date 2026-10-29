@@ -227,6 +227,8 @@ export default function App() {
       }
     } catch (err) {
       console.error('Google Sign-In failed:', err);
+      setIsDriveModalOpen(true);
+      throw err;
     } finally {
       setIsLoggingIn(false);
     }

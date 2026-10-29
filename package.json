@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "vite build && mkdir -p docs/assets && cp dist/index.html docs/index.html && cp dist/assets/app.js docs/assets/app.js && cp dist/assets/index.css docs/assets/index.css && cp public/templates_store_backup.json docs/templates_store_backup.json && touch docs/.nojekyll",
+    "build": "vite build && mkdir -p docs/assets assets && cp dist/index.html docs/index.html && cp dist/assets/app.js docs/assets/app.js && cp dist/assets/index.css docs/assets/index.css && cp dist/assets/app.js assets/app.js && cp dist/assets/index.css assets/index.css && cp public/templates_store_backup.json docs/templates_store_backup.json && touch docs/.nojekyll",
     "start": "node server.ts",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",

@@ -136,6 +136,10 @@ export const GoogleDriveModal: React.FC<GoogleDriveModalProps> = ({
   const [publicDriveLinkInput, setPublicDriveLinkInput] = useState<string>('');
   const [isLinkingPublicDrive, setIsLinkingPublicDrive] = useState<boolean>(false);
   const [copiedShareLink, setCopiedShareLink] = useState<boolean>(false);
+  const [copiedDomain, setCopiedDomain] = useState<boolean>(false);
+  const [unauthorizedDomainHost, setUnauthorizedDomainHost] = useState<string | null>(
+    null
+  );
   const [statusMessage, setStatusMessage] = useState<{
     type: 'success' | 'error' | 'info';
     text: string;
@@ -176,15 +180,95 @@ export const GoogleDriveModal: React.FC<GoogleDriveModalProps> = ({
 
   if (!isOpen) return null;
 
+  // Build fallback list of Google Drive files directly from templatesConfig so visitors on GitHub Pages
+  // can view, open on Drive, and use all synced Google Drive .docx templates even without OAuth login
+  const sharedDriveFilesFromConfig: DriveFileItem[] = Object.entries(
+    templatesConfig
+  ).map(([tplName, entry]) => ({
+    id: entry.drive_file_id || `local_${tplName}`,
+    name: `${tplName}.docx`,
+    mimeType:
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    modifiedTime: entry.updated_at,
+    webViewLink:
+      entry.drive_web_view_link ||
+      (entry.drive_file_id
+        ? `https://drive.google.com/file/d/${entry.drive_file_id}/view?usp=sharing`
+        : undefined),
+  }));
+
+  const rawDisplayFiles =
+    !needsAuth && user && driveFiles.length > 0
+      ? driveFiles
+      : sharedDriveFilesFromConfig;
+
+  const displayFiles = searchQuery.trim()
+    ? rawDisplayFiles.filter((f) =>
+        f.name.toLowerCase().includes(searchQuery.trim().toLowerCase())
+      )
+    : rawDisplayFiles;
+
   const existingBackupFile = driveFiles.find(
     (f) => f.name === SHARED_BACKUP_FILE_NAME
   );
+
+  const handleModalLoginClick = async () => {
+    setStatusMessage(null);
+    setUnauthorizedDomainHost(null);
+    try {
+      await onLogin();
+    } catch (err: any) {
+      const code = err?.code || '';
+      const msg = err?.message || '';
+      if (
+        code === 'auth/unauthorized-domain' ||
+        msg.includes('unauthorized-domain')
+      ) {
+        const host = window.location.hostname || 'nplongpersonal-hue.github.io';
+        setUnauthorizedDomainHost(host);
+        setStatusMessage({
+          type: 'error',
+          text: `Tên miền "${host}" chưa được thêm vào danh sách Authorized Domains của Firebase Authentication. Xem hướng dẫn 1 bước bên dưới để bật đăng nhập Google trên GitHub Pages (hoặc sử dụng trực tiếp 6 mẫu Google Drive đã đồng bộ sẵn bên dưới mà không cần đăng nhập).`,
+        });
+      } else if (code !== 'auth/popup-closed-by-user') {
+        setStatusMessage({
+          type: 'error',
+          text: `Không thể đăng nhập Google: ${msg || 'Vui lòng kiểm tra trình chặn popup.'}`,
+        });
+      }
+    }
+  };
 
   // Handle importing a .docx or Google Doc from Drive into the Template Configurator
   const handleSelectDocxFromDrive = async (item: DriveFileItem) => {
     setBusyFileId(item.id);
     setStatusMessage(null);
     try {
+      // First check if this file exists in templatesConfig with base64_docx (instant offline/GitHub Pages support)
+      const matchedEntry = Object.entries(templatesConfig).find(
+        ([tplName, entry]) =>
+          entry.drive_file_id === item.id ||
+          `${tplName}.docx` === item.name ||
+          tplName === item.name
+      );
+
+      if ((needsAuth || !user) && matchedEntry?.[1]?.base64_docx) {
+        const binaryString = window.atob(matchedEntry[1].base64_docx);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+          bytes[i] = binaryString.charCodeAt(i);
+        }
+        const safeName = item.name.endsWith('.docx')
+          ? item.name
+          : `${item.name}.docx`;
+        const docxFile = new File([bytes], safeName, {
+          type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        });
+        await onImportDocxFromDrive(docxFile);
+        onClose();
+        return;
+      }
+
       const { buffer, fileName } = await downloadDriveDocxAsArrayBuffer(item);
       const docxFile = new File([buffer], fileName, {
         type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
@@ -192,6 +276,30 @@ export const GoogleDriveModal: React.FC<GoogleDriveModalProps> = ({
       await onImportDocxFromDrive(docxFile);
       onClose();
     } catch (err: any) {
+      // Fallback to base64_docx if Drive API download failed
+      const matchedEntry = Object.entries(templatesConfig).find(
+        ([tplName, entry]) =>
+          entry.drive_file_id === item.id ||
+          `${tplName}.docx` === item.name ||
+          tplName === item.name
+      );
+      if (matchedEntry?.[1]?.base64_docx) {
+        const binaryString = window.atob(matchedEntry[1].base64_docx);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+          bytes[i] = binaryString.charCodeAt(i);
+        }
+        const safeName = item.name.endsWith('.docx')
+          ? item.name
+          : `${item.name}.docx`;
+        const docxFile = new File([bytes], safeName, {
+          type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        });
+        await onImportDocxFromDrive(docxFile);
+        onClose();
+        return;
+      }
+
       if (err?.message === 'UNAUTHENTICATED') {
         onAuthExpired();
       } else {
@@ -616,236 +724,290 @@ export const GoogleDriveModal: React.FC<GoogleDriveModalProps> = ({
             </div>
           )}
 
+          {unauthorizedDomainHost && (
+            <div className="p-4 bg-amber-50 border border-amber-300 rounded-lg space-y-2.5">
+              <div className="flex items-start gap-2.5">
+                <AlertTriangle className="w-5 h-5 text-amber-700 shrink-0 mt-0.5" />
+                <div className="space-y-1">
+                  <h4 className="text-xs font-bold text-amber-950">
+                    Cách bật Đăng nhập Google trên tên miền GitHub Pages ({unauthorizedDomainHost})
+                  </h4>
+                  <p className="text-xs text-amber-900 leading-relaxed">
+                    Firebase chặn cửa sổ đăng nhập trên tên miền mới chưa khai báo. Bạn chỉ cần bấm nút{' '}
+                    <strong>&ldquo;Mở Firebase Authorized Domains&rdquo;</strong> bên dưới, bấm{' '}
+                    <strong>Add domain</strong> và dán <code className="font-mono-tabular font-bold">{unauthorizedDomainHost}</code> vào là đăng nhập được ngay:
+                  </p>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => {
+                    navigator.clipboard.writeText(unauthorizedDomainHost);
+                    setCopiedDomain(true);
+                    setTimeout(() => setCopiedDomain(false), 2500);
+                  }}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-amber-950 bg-white border border-amber-300 hover:bg-amber-100 rounded-md cursor-pointer"
+                >
+                  {copiedDomain ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 text-emerald-700" />
+                      <span>Đã copy: {unauthorizedDomainHost}</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5" />
+                      <span>Copy tên miền: {unauthorizedDomainHost}</span>
+                    </>
+                  )}
+                </button>
+                <a
+                  href="https://console.firebase.google.com/project/gen-lang-client-0468488022/authentication/settings"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-amber-700 hover:bg-amber-800 rounded-md"
+                >
+                  <span>Mở Firebase Authorized Domains</span>
+                  <ExternalLink className="w-3.5 h-3.5" />
+                </a>
+              </div>
+            </div>
+          )}
+
           {needsAuth || !user ? (
-            <div className="p-6 bg-slate-50 border border-slate-200 rounded-lg text-center space-y-4">
-              <Cloud className="w-9 h-9 text-blue-700 mx-auto" />
-              <div className="space-y-1 max-w-md mx-auto">
-                <h3 className="text-sm font-semibold text-slate-900">
-                  Đăng nhập Google để lưu và chia sẻ kho mẫu từ Google Drive của bạn
+            <div className="p-4 bg-slate-50 border border-slate-200 rounded-lg flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              <div className="space-y-1">
+                <h3 className="text-xs font-semibold text-slate-900">
+                  Đăng nhập Google để tải thêm mẫu mới lên Google Drive của bạn
                 </h3>
-                <p className="text-xs text-slate-600 leading-relaxed">
-                  Khi bạn đăng nhập và bấm &ldquo;Lưu & Chia Sẻ Kho Mẫu Lên Google Drive&rdquo;, toàn bộ các mẫu Word (.docx) và cấu hình trường Mailings sẽ được lưu vào Google Drive của bạn và chia sẻ quyền đọc để bất kỳ ai mở ứng dụng đều truy cập được.
+                <p className="text-[11px] text-slate-600 leading-relaxed">
+                  Các mẫu đã đồng bộ sẵn trên Google Drive vẫn hiển thị và sử dụng trực tiếp bên dưới mà không cần đăng nhập.
                 </p>
               </div>
-              <div className="flex justify-center pt-1">
+              <div className="shrink-0">
                 <GoogleSignInButton
-                  onClick={onLogin}
+                  onClick={handleModalLoginClick}
                   disabled={isLoggingIn}
                   label={isLoggingIn ? 'Connecting...' : 'Sign in with Google'}
                 />
               </div>
             </div>
           ) : (
-            <>
-              {/* Connected User Bar & Primary "Save & Share on Google Drive" Action */}
-              <div className="p-4 bg-slate-50 border border-slate-200 rounded-lg flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                <div className="flex items-center gap-3 min-w-0">
-                  <div className="w-9 h-9 rounded-full bg-blue-700 text-white font-semibold text-sm flex items-center justify-center shrink-0">
-                    {(user.displayName || user.email || 'G')[0].toUpperCase()}
-                  </div>
-                  <div className="min-w-0">
-                    <p className="text-xs font-semibold text-slate-900 truncate">
-                      {user.displayName || 'Chủ sở hữu Kho Google Drive'}
-                    </p>
-                    <p className="text-[11px] text-slate-500 truncate">
-                      {user.email}
-                    </p>
-                  </div>
+            /* Connected User Bar & Primary "Save & Share on Google Drive" Action */
+            <div className="p-4 bg-slate-50 border border-slate-200 rounded-lg flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              <div className="flex items-center gap-3 min-w-0">
+                <div className="w-9 h-9 rounded-full bg-blue-700 text-white font-semibold text-sm flex items-center justify-center shrink-0">
+                  {(user.displayName || user.email || 'G')[0].toUpperCase()}
                 </div>
-
-                <div className="flex flex-wrap items-center gap-2">
-                  <button
-                    type="button"
-                    disabled={isPublishingToDrive}
-                    onClick={() =>
-                      setPendingConfirm({
-                        type: 'publish_shared_drive',
-                        title:
-                          'Lưu & Chia sẻ công khai Kho Biểu Mẫu trên Google Drive?',
-                        description: `Ứng dụng sẽ tải toàn bộ ${
-                          Object.keys(templatesConfig).length
-                        } biểu mẫu Word (.docx) cùng tệp cấu hình "${SHARED_BACKUP_FILE_NAME}" vào thư mục "${SHARED_DRIVE_FOLDER_NAME}" trên Google Drive (${
-                          user.email
-                        }) và bật quyền xem ("Bất kỳ ai có đường liên kết đều có thể xem") để mọi người truy cập ứng dụng đều sử dụng được các mẫu này.`,
-                      })
-                    }
-                    className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-blue-700 hover:bg-blue-800 disabled:opacity-60 rounded-md whitespace-nowrap shrink-0 cursor-pointer"
-                  >
-                    <Share2 className="w-3.5 h-3.5" />
-                    <span>
-                      {isPublishingToDrive
-                        ? 'Đang lưu & bật chia sẻ trên Google Drive...'
-                        : 'Lưu & Chia Sẻ Kho Mẫu Lên Google Drive'}
-                    </span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={onLogout}
-                    className="inline-flex items-center gap-1 px-2.5 py-2 text-xs font-medium text-slate-600 bg-white border border-slate-300 hover:bg-slate-100 rounded-md whitespace-nowrap shrink-0 cursor-pointer"
-                  >
-                    <LogOut className="w-3.5 h-3.5" />
-                    <span>Đăng xuất</span>
-                  </button>
+                <div className="min-w-0">
+                  <p className="text-xs font-semibold text-slate-900 truncate">
+                    {user.displayName || 'Chủ sở hữu Kho Google Drive'}
+                  </p>
+                  <p className="text-[11px] text-slate-500 truncate">
+                    {user.email}
+                  </p>
                 </div>
               </div>
 
-              {/* Search & Refresh Drive Files */}
-              <div className="flex items-center gap-2">
-                <div className="relative flex-1">
-                  <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-                  <input
-                    type="text"
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') fetchFiles(searchQuery);
-                    }}
-                    placeholder="Tìm tệp .docx, Google Docs hoặc bản sao lưu trên Google Drive..."
-                    className="w-full pl-9 pr-3 py-2 text-xs bg-slate-50 border border-slate-300 rounded-lg text-slate-900 focus:bg-white focus:outline-none focus:border-blue-600"
-                  />
-                </div>
+              <div className="flex flex-wrap items-center gap-2">
                 <button
                   type="button"
-                  onClick={() => fetchFiles(searchQuery)}
-                  disabled={isLoadingFiles}
-                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg whitespace-nowrap shrink-0 cursor-pointer"
+                  disabled={isPublishingToDrive}
+                  onClick={() =>
+                    setPendingConfirm({
+                      type: 'publish_shared_drive',
+                      title:
+                        'Lưu & Chia sẻ công khai Kho Biểu Mẫu trên Google Drive?',
+                      description: `Ứng dụng sẽ tải toàn bộ ${
+                        Object.keys(templatesConfig).length
+                      } biểu mẫu Word (.docx) cùng tệp cấu hình "${SHARED_BACKUP_FILE_NAME}" vào thư mục "${SHARED_DRIVE_FOLDER_NAME}" trên Google Drive (${
+                        user.email
+                      }) và bật quyền xem ("Bất kỳ ai có đường liên kết đều có thể xem") để mọi người truy cập ứng dụng đều sử dụng được các mẫu này.`,
+                    })
+                  }
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-blue-700 hover:bg-blue-800 disabled:opacity-60 rounded-md whitespace-nowrap shrink-0 cursor-pointer"
                 >
-                  <RefreshCw
-                    className={`w-3.5 h-3.5 ${
-                      isLoadingFiles ? 'animate-spin' : ''
-                    }`}
-                  />
-                  <span>Tìm / Làm mới</span>
+                  <Share2 className="w-3.5 h-3.5" />
+                  <span>
+                    {isPublishingToDrive
+                      ? 'Đang lưu & bật chia sẻ trên Google Drive...'
+                      : 'Lưu & Chia Sẻ Kho Mẫu Lên Google Drive'}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={onLogout}
+                  className="inline-flex items-center gap-1 px-2.5 py-2 text-xs font-medium text-slate-600 bg-white border border-slate-300 hover:bg-slate-100 rounded-md whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  <LogOut className="w-3.5 h-3.5" />
+                  <span>Đăng xuất</span>
                 </button>
               </div>
+            </div>
+          )}
 
-              {/* Files List */}
-              <div className="border border-slate-200 rounded-lg overflow-hidden">
-                <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between text-xs font-semibold text-slate-600">
-                  <span>Tệp Word (.docx), Google Docs & Kho sao lưu trên Drive của bạn</span>
-                  <span className="font-mono-tabular">{driveFiles.length} tệp</span>
-                </div>
+          {/* Search & Refresh Drive Files (Always Visible) */}
+          <div className="flex items-center gap-2">
+            <div className="relative flex-1">
+              <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !needsAuth && user) {
+                    fetchFiles(searchQuery);
+                  }
+                }}
+                placeholder="Tìm tệp .docx trên Google Drive..."
+                className="w-full pl-9 pr-3 py-2 text-xs bg-slate-50 border border-slate-300 rounded-lg text-slate-900 focus:bg-white focus:outline-none focus:border-blue-600"
+              />
+            </div>
+            {!needsAuth && user && (
+              <button
+                type="button"
+                onClick={() => fetchFiles(searchQuery)}
+                disabled={isLoadingFiles}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <RefreshCw
+                  className={`w-3.5 h-3.5 ${
+                    isLoadingFiles ? 'animate-spin' : ''
+                  }`}
+                />
+                <span>Tìm / Làm mới</span>
+              </button>
+            )}
+          </div>
 
-                {isLoadingFiles ? (
-                  <div className="p-8 text-center text-xs text-slate-500">
-                    Đang tải danh sách tệp từ Google Drive...
-                  </div>
-                ) : driveFiles.length === 0 ? (
-                  <div className="p-8 text-center text-xs text-slate-500">
-                    Không tìm thấy tệp Word (.docx) hoặc Google Docs nào khớp với tìm kiếm trên Google Drive.
-                  </div>
-                ) : (
-                  <div className="divide-y divide-slate-200 max-h-[260px] overflow-y-auto">
-                    {driveFiles.map((file) => {
-                      const isBackupJson =
-                        file.name.includes('templates_store_backup') ||
-                        file.mimeType.includes('json');
-                      const isGoogleDoc =
-                        file.mimeType === 'application/vnd.google-apps.document';
-                      const isBusy = busyFileId === file.id;
+          {/* Files List (Always Visible: shows live OAuth Drive files OR synced Drive files from templatesConfig) */}
+          <div className="border border-slate-200 rounded-lg overflow-hidden">
+            <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between text-xs font-semibold text-slate-600">
+              <span>
+                {!needsAuth && user && driveFiles.length > 0
+                  ? 'Tệp Word (.docx), Google Docs & Kho sao lưu trên Drive của bạn'
+                  : 'Các biểu mẫu Word (.docx) trên Google Drive đã đồng bộ sẵn'}
+              </span>
+              <span className="font-mono-tabular">{displayFiles.length} tệp</span>
+            </div>
 
-                      return (
-                        <div
-                          key={file.id}
-                          className="px-4 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3 hover:bg-slate-50 transition-colors"
-                        >
-                          <div className="flex items-start gap-2.5 min-w-0">
-                            <FileText className="w-4 h-4 text-blue-700 shrink-0 mt-0.5" />
-                            <div className="min-w-0">
-                              <p className="text-xs font-semibold text-slate-900 truncate">
-                                {file.name}
-                              </p>
-                              <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-slate-500">
-                                <span>
-                                  {isBackupJson
-                                    ? 'Tệp dữ liệu Kho biểu mẫu dùng chung (JSON)'
-                                    : isGoogleDoc
-                                    ? 'Google Docs (Tự động chuyển sang .docx)'
-                                    : 'Microsoft Word (.docx)'}
+            {isLoadingFiles ? (
+              <div className="p-8 text-center text-xs text-slate-500">
+                Đang tải danh sách tệp từ Google Drive...
+              </div>
+            ) : displayFiles.length === 0 ? (
+              <div className="p-8 text-center text-xs text-slate-500">
+                Không tìm thấy tệp Word (.docx) nào khớp với tìm kiếm.
+              </div>
+            ) : (
+              <div className="divide-y divide-slate-200 max-h-[260px] overflow-y-auto">
+                {displayFiles.map((file) => {
+                  const isBackupJson =
+                    file.name.includes('templates_store_backup') ||
+                    file.mimeType.includes('json');
+                  const isGoogleDoc =
+                    file.mimeType === 'application/vnd.google-apps.document';
+                  const isBusy = busyFileId === file.id;
+
+                  return (
+                    <div
+                      key={file.id}
+                      className="px-4 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3 hover:bg-slate-50 transition-colors"
+                    >
+                      <div className="flex items-start gap-2.5 min-w-0">
+                        <FileText className="w-4 h-4 text-blue-700 shrink-0 mt-0.5" />
+                        <div className="min-w-0">
+                          <p className="text-xs font-semibold text-slate-900 truncate">
+                            {file.name}
+                          </p>
+                          <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-slate-500">
+                            <span>
+                              {isBackupJson
+                                ? 'Tệp dữ liệu Kho biểu mẫu dùng chung (JSON)'
+                                : isGoogleDoc
+                                ? 'Google Docs (Tự động chuyển sang .docx)'
+                                : 'Microsoft Word (.docx) · Google Drive'}
+                            </span>
+                            {file.modifiedTime && (
+                              <>
+                                <span aria-hidden="true">·</span>
+                                <span className="font-mono-tabular">
+                                  {new Date(file.modifiedTime).toLocaleString(
+                                    'vi-VN'
+                                  )}
                                 </span>
-                                {file.modifiedTime && (
-                                  <>
-                                    <span aria-hidden="true">·</span>
-                                    <span className="font-mono-tabular">
-                                      {new Date(file.modifiedTime).toLocaleString(
-                                        'vi-VN'
-                                      )}
-                                    </span>
-                                  </>
-                                )}
-                              </div>
-                            </div>
-                          </div>
-
-                          <div className="flex items-center gap-2 shrink-0 self-end sm:self-center">
-                            {isBackupJson ? (
-                              <button
-                                type="button"
-                                disabled={isBusy}
-                                onClick={() => handleRestoreFromBackupFile(file)}
-                                className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold text-emerald-800 bg-emerald-50 border border-emerald-300 hover:bg-emerald-100 rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                              >
-                                <CloudDownload className="w-3.5 h-3.5" />
-                                <span>
-                                  {isBusy
-                                    ? 'Đang nạp...'
-                                    : 'Nạp kho mẫu này'}
-                                </span>
-                              </button>
-                            ) : (
-                              <button
-                                type="button"
-                                disabled={isBusy}
-                                onClick={() => handleSelectDocxFromDrive(file)}
-                                className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                              >
-                                <CloudDownload className="w-3.5 h-3.5" />
-                                <span>
-                                  {isBusy
-                                    ? 'Đang tải...'
-                                    : 'Chọn làm mẫu Word'}
-                                </span>
-                              </button>
+                              </>
                             )}
-
-                            {file.webViewLink && (
-                              <a
-                                href={file.webViewLink}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                title="Mở trên Google Drive"
-                                className="p-1.5 text-slate-500 hover:text-slate-900 rounded hover:bg-slate-100"
-                              >
-                                <ExternalLink className="w-3.5 h-3.5" />
-                              </a>
-                            )}
-
-                            <button
-                              type="button"
-                              disabled={isBusy}
-                              onClick={() =>
-                                setPendingConfirm({
-                                  type: 'delete_file',
-                                  file,
-                                  title: `Xóa tệp "${file.name}" khỏi Google Drive?`,
-                                  description: `Bạn có chắc chắn muốn xóa vĩnh viễn tệp "${file.name}" khỏi Google Drive của bạn không? Hành động này không thể hoàn tác.`,
-                                })
-                              }
-                              title="Xóa tệp khỏi Google Drive"
-                              className="p-1.5 text-red-600 hover:text-red-700 rounded hover:bg-red-50 cursor-pointer"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
                           </div>
                         </div>
-                      );
-                    })}
-                  </div>
-                )}
+                      </div>
+
+                      <div className="flex items-center gap-2 shrink-0 self-end sm:self-center">
+                        {isBackupJson ? (
+                          <button
+                            type="button"
+                            disabled={isBusy}
+                            onClick={() => handleRestoreFromBackupFile(file)}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold text-emerald-800 bg-emerald-50 border border-emerald-300 hover:bg-emerald-100 rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                          >
+                            <CloudDownload className="w-3.5 h-3.5" />
+                            <span>
+                              {isBusy ? 'Đang nạp...' : 'Nạp kho mẫu này'}
+                            </span>
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            disabled={isBusy}
+                            onClick={() => handleSelectDocxFromDrive(file)}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                          >
+                            <CloudDownload className="w-3.5 h-3.5" />
+                            <span>
+                              {isBusy ? 'Đang tải...' : 'Chọn làm mẫu Word'}
+                            </span>
+                          </button>
+                        )}
+
+                        {file.webViewLink && (
+                          <a
+                            href={file.webViewLink}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            title="Mở tệp này trên Google Drive"
+                            className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-slate-600 bg-white border border-slate-200 hover:text-slate-900 rounded hover:bg-slate-100"
+                          >
+                            <span>Mở Drive</span>
+                            <ExternalLink className="w-3 h-3" />
+                          </a>
+                        )}
+
+                        {!needsAuth && user && (
+                          <button
+                            type="button"
+                            disabled={isBusy}
+                            onClick={() =>
+                              setPendingConfirm({
+                                type: 'delete_file',
+                                file,
+                                title: `Xóa tệp "${file.name}" khỏi Google Drive?`,
+                                description: `Bạn có chắc chắn muốn xóa vĩnh viễn tệp "${file.name}" khỏi Google Drive của bạn không? Hành động này không thể hoàn tác.`,
+                              })
+                            }
+                            title="Xóa tệp khỏi Google Drive"
+                            className="p-1.5 text-red-600 hover:text-red-700 rounded hover:bg-red-50 cursor-pointer"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
-            </>
-          )}
+            )}
+          </div>
 
           {/* Connect via Public Google Drive Link / File ID (No Login Required for Visitors) */}
           <div className="p-4 bg-slate-50 border border-slate-200 rounded-lg space-y-2.5">
